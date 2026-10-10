@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import time
 from typing import List, Optional
 
@@ -28,6 +29,60 @@ DURATION_PRESETS = {
     20: (409, 24),   # capped at 409 (API max for 720p); actual ~17s
 }
 
+# ── Agnes Video 2.5-series submit protocol (mode / seconds / size / aspect_ratio) ──
+# The 2.5 series rejects the legacy width/height/num_frames/frame_rate fields with
+# `400 width is a forbidden field`, so those models must use the new contract.
+VIDEO_MODEL_25_PREFIX = "agnes-video-2.5"
+
+VIDEO_ASPECT_RATIOS = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+
+# Project-standard pixel tiers map explicitly to an aspect_ratio enum. Numerical
+# nearest-neighbour would misfile 1152x768 (3:2) as 4:3 and 768x1152 (2:3) as 3:4.
+STANDARD_PIXEL_TO_RATIO = {
+    (768, 1152): "9:16",
+    (720, 1280): "9:16",
+    (768, 1344): "9:16",
+    (1024, 1792): "9:16",
+    (1152, 768): "16:9",
+    (1280, 720): "16:9",
+    (1344, 768): "16:9",
+    (1792, 1024): "16:9",
+    (1024, 1024): "1:1",
+}
+
+
+def is_v25_video_model(model: str) -> bool:
+    """2.5-series video models use the new submit protocol."""
+    return bool(model) and model.startswith(VIDEO_MODEL_25_PREFIX)
+
+
+def width_height_to_aspect_ratio(width: int, height: int) -> str:
+    """Map pixel dimensions onto the 2.5-series aspect_ratio enum."""
+    if not width or not height:
+        return "16:9"
+    exact = STANDARD_PIXEL_TO_RATIO.get((width, height))
+    if exact:
+        return exact
+    ratio = width / height
+    best, best_dist = "16:9", float("inf")
+    for ar in VIDEO_ASPECT_RATIOS:
+        w, h = ar.split(":")
+        dist = abs(ratio - int(w) / int(h))
+        if dist < best_dist:
+            best_dist, best = dist, ar
+    return best
+
+
+# ── Queue-type upstream 503 (video_queue_full / fail_to_fetch_task) ──
+# These get their own time-based retry budget that does NOT consume the ordinary
+# 5xx retry quota: an Agnes video queue stays full for 12+ minutes in practice,
+# while the default 5x30s backoff gives up after ~7 minutes. A queue-full rejection
+# creates no task and spends no quota, so waiting costs nothing.
+_QUEUE_FULL_CODES = {"video_queue_full", "fail_to_fetch_task"}
+_QUEUE_RETRY_BASE_DELAY = 30.0
+_QUEUE_RETRY_JITTER = 30.0
+DEFAULT_QUEUE_RETRY_BUDGET = 1800  # seconds
+
 
 class VideoOutput:
     def __init__(self, fmt: str, ext: str, data: str):
@@ -49,7 +104,7 @@ class AgnesVideoAPI:
     def __init__(
         self,
         api_key: str,
-        model: str = "agnes-video-v2.0",
+        model: str = "agnes-video-2.5-flash",
         default_duration: int = 5,
         max_retries: int = 5,
         retry_base_delay: float = 30.0,
@@ -127,7 +182,7 @@ class AgnesVideoAPI:
             try:
                 b64_data = self._path_to_b64(image_path)
                 payload = {
-                    "model": "agnes-image-2.1-flash",
+                    "model": "agnes-image-2.5-flash",
                     "prompt": "Keep the image exactly as it is",
                     "n": 1,
                     "size": "1024x1024",
@@ -308,7 +363,12 @@ class AgnesVideoAPI:
 
     async def _submit_with_retry(self, payload: dict, mode_desc: str) -> str:
         frame_reductions_left = 2  # allow up to 2 frame-count reductions on 400
-        for attempt in range(self.max_retries):
+        attempt = 0
+        # Queue-full track: a separate wall-clock budget that does not spend `attempt`.
+        queue_started = None
+        queue_deadline = None
+        queue_retries = 0
+        while attempt < self.max_retries:
             if self.shutdown_event and self.shutdown_event.is_set():
                 raise RuntimeError("Video generation cancelled by user")
             try:
@@ -350,9 +410,65 @@ class AgnesVideoAPI:
                         extra={"mode": mode_desc},
                     )
                     await asyncio.sleep(delay)
+                    attempt += 1
                     continue
 
                 if resp.status_code >= 500:
+                    # Queue-type 503: retry on its own budget, not the 5xx quota.
+                    # The queue-full body carries `code` at the top level
+                    # ({"code": "video_queue_full", ...}); other errors nest it
+                    # under `error`, so check both.
+                    code = ""
+                    try:
+                        body = resp.json() or {}
+                        code = body.get("code") or (body.get("error") or {}).get("code") or ""
+                    except Exception:
+                        code = ""
+                    if code in _QUEUE_FULL_CODES:
+                        if queue_deadline is None:
+                            queue_started = time.monotonic()
+                            queue_deadline = queue_started + DEFAULT_QUEUE_RETRY_BUDGET
+                            logger.warning(
+                                f"[AgnesVideo] {mode_desc}: Agnes video queue full "
+                                f"(HTTP {resp.status_code} · {code}), waiting on a "
+                                f"separate track (budget {DEFAULT_QUEUE_RETRY_BUDGET}s)"
+                            )
+                        waited = time.monotonic() - (queue_started or time.monotonic())
+                        if time.monotonic() >= queue_deadline:
+                            collect_error(
+                                "video", "submit_video",
+                                prompt=payload.get("prompt", ""),
+                                error_type=f"QueueFull_{code}",
+                                error_message=f"HTTP {resp.status_code}: {code}",
+                                status_code=resp.status_code,
+                                response_body=resp.text,
+                                retry_count=queue_retries,
+                                extra={"mode": mode_desc, "waited_s": int(waited)},
+                            )
+                            raise RuntimeError(
+                                f"[AgnesVideo] {mode_desc}: video queue still full "
+                                f"after {int(waited)}s (HTTP {resp.status_code} · {code})"
+                            )
+                        delay = _QUEUE_RETRY_BASE_DELAY + random.uniform(0, _QUEUE_RETRY_JITTER)
+                        queue_retries += 1
+                        logger.warning(
+                            f"[AgnesVideo] Agnes video queue full on {mode_desc}, "
+                            f"queue retry #{queue_retries} (waited {waited:.0f}s) "
+                            f"in {delay:.0f}s..."
+                        )
+                        collect_error(
+                            "video", "submit_video",
+                            prompt=payload.get("prompt", ""),
+                            error_type=f"QueueFull_{code}",
+                            error_message=f"HTTP {resp.status_code}: {code}",
+                            status_code=resp.status_code,
+                            response_body=resp.text,
+                            retry_count=queue_retries,
+                            extra={"mode": mode_desc, "waited_s": int(waited)},
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
                     delay = self.retry_base_delay * (attempt + 1)
                     logger.warning(
                         f"[AgnesVideo] {resp.status_code} server error on {mode_desc}, "
@@ -369,6 +485,7 @@ class AgnesVideoAPI:
                         extra={"mode": mode_desc},
                     )
                     await asyncio.sleep(delay)
+                    attempt += 1
                     continue
 
                 # HTTP 400 with num_frames exceeded → reduce frames and retry
@@ -395,6 +512,7 @@ class AgnesVideoAPI:
                     )
                     payload["num_frames"] = new_nf
                     frame_reductions_left -= 1
+                    attempt += 1
                     continue
 
                 logger.error(f"[AgnesVideo] HTTP {resp.status_code}: {error_text}")
@@ -426,6 +544,7 @@ class AgnesVideoAPI:
                         f"retry {attempt + 1}/{self.max_retries} in {delay:.0f}s..."
                     )
                     await asyncio.sleep(delay)
+                    attempt += 1
                     continue
                 raise
 
@@ -476,6 +595,19 @@ class AgnesVideoAPI:
         negative_prompt: Optional[str] = None,
         **kwargs,
     ) -> str:
+        # 2.5-series models speak the new protocol (mode/seconds/size/aspect_ratio)
+        # and reject the legacy width/height/num_frames/frame_rate fields.
+        if is_v25_video_model(self.model):
+            return await self._submit_video_v25(
+                prompt=prompt,
+                reference_image_paths=reference_image_paths,
+                duration=duration,
+                width=width,
+                height=height,
+                seed=seed,
+                **kwargs,
+            )
+
         num_frames, frame_rate = self._get_frame_config(duration, width, height)
 
         payload: dict = {
@@ -509,6 +641,57 @@ class AgnesVideoAPI:
                 "mode": "keyframes",
             }
             mode_desc = f"keyframes ({n_refs} frames)"
+
+        logger.info(f"[AgnesVideo] {mode_desc}: {prompt[:80]}...")
+
+        video_id = await self._submit_with_retry(payload, mode_desc)
+        logger.info(f"[AgnesVideo] Video submitted: {video_id[:20]}...")
+        return video_id
+
+    async def _submit_video_v25(
+        self,
+        prompt: str,
+        reference_image_paths: List[str],
+        duration: Optional[int] = None,
+        width: int = 1152,
+        height: int = 768,
+        seed: Optional[int] = None,
+        **kwargs,
+    ) -> str:
+        """2.5-series submit protocol: mode / seconds / size / aspect_ratio.
+
+        Differences from the v2.0 protocol:
+        - size is 720P (flash) or 720P/960P/2K; width/height/num_frames are rejected
+        - seconds is a string clamped to the API's 4-12 range
+        - reference images use mode=reference + images[]; negative_prompt is ignored
+        """
+        secs = int(duration) if duration else self.default_duration
+        seconds = str(max(4, min(secs, 12)))
+        size = kwargs.get("video_size") or "720P"
+        if self.model == "agnes-video-2.5-flash":
+            size = "720P"
+
+        payload: dict = {
+            "model": self.model,
+            "prompt": prompt,
+            "mode": "text",
+            "seconds": seconds,
+            "size": size,
+            "aspect_ratio": width_height_to_aspect_ratio(width, height),
+        }
+        if seed is not None:
+            payload["seed"] = seed
+
+        resolved_refs = []
+        for p in reference_image_paths:
+            resolved_refs.append(await self._resolve_image_ref(p))
+
+        if resolved_refs:
+            payload["mode"] = "reference"
+            payload["images"] = resolved_refs[:5]
+            mode_desc = f"reference ({min(len(resolved_refs), 5)} images)"
+        else:
+            mode_desc = "text-to-video"
 
         logger.info(f"[AgnesVideo] {mode_desc}: {prompt[:80]}...")
 

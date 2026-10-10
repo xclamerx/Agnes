@@ -58,9 +58,9 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
         api_key: str,
         task_id: str,
         dir_name: str = None,
-        chat_model: str = "agnes-2.0-flash",
-        image_model: str = "agnes-image-2.1-flash",
-        video_model: str = "agnes-video-v2.0",
+        chat_model: str = "agnes-3.0-flash",
+        image_model: str = "agnes-image-2.5-flash",
+        video_model: str = "agnes-video-2.5-flash",
         progress_callback: Optional[Callable] = None,
         shutdown_event: Optional[asyncio.Event] = None,
     ):

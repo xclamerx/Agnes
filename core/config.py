@@ -412,9 +412,11 @@ DURATION_FRAME_MAP = {
 # ═══════════════════════════════════════════════════
 
 # 各类型 Agnes 模型默认值（与三个 API 客户端的默认 model 对齐）
-DEFAULT_TEXT_MODEL = "agnes-2.0-flash"
-DEFAULT_IMAGE_MODEL = "agnes-image-2.1-flash"
-DEFAULT_VIDEO_MODEL = "agnes-video-v2.0"
+# 注意：默认值必须是 /v1/models 当前在售的型号。旧默认 agnes-2.0-flash / agnes-image-2.1-flash /
+# agnes-video-v2.0 已下线（上游返回 "No available channel for model"），故改为 3.0 / 2.5 系列。
+DEFAULT_TEXT_MODEL = "agnes-3.0-flash"
+DEFAULT_IMAGE_MODEL = "agnes-image-2.5-flash"
+DEFAULT_VIDEO_MODEL = "agnes-video-2.5-flash"
 
 DEFAULT_MODELS = {
     "text": DEFAULT_TEXT_MODEL,

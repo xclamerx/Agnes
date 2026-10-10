@@ -36,7 +36,7 @@ def _classify(model_id: str) -> str:
 
     - ``agnes-image*`` → image
     - ``agnes-video*`` → video
-    - 其余（如 ``agnes-2.0-flash`` / ``agnes-2.5-flash``）→ text
+    - 其余（如 ``agnes-3.0-flash`` / ``agnes-2.5-flash``）→ text
     """
     if model_id.startswith("agnes-image"):
         return "image"
